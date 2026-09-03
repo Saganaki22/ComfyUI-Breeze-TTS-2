@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import gc
+import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -204,6 +205,28 @@ def resolve_dtype_mode(dtype_name: str, device: torch.device) -> str:
     return "fp32"
 
 
+def flash_attn_installed() -> bool:
+    """True only when flash_attn is a real, importable, installed distribution.
+
+    find_spec alone is not enough: other node packs (e.g. SeedVR2) inject a
+    stub flash_attn module with a valid __spec__ into sys.modules when the real
+    package is missing, so find_spec reports a false positive. transformers
+    resolves the version through importlib.metadata, which then raises
+    PackageNotFoundError deep inside model construction.
+    """
+    if importlib.util.find_spec("flash_attn") is None:
+        return False
+    try:
+        importlib.metadata.version("flash_attn")
+    except importlib.metadata.PackageNotFoundError:
+        logger.warning(
+            "flash_attn is present in sys.modules but has no package metadata "
+            "(a stub installed by another custom node); treating it as unavailable."
+        )
+        return False
+    return True
+
+
 def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> str:
     """Returns the transformers attention implementation wired into all submodels.
 
@@ -211,7 +234,7 @@ def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> 
     native.attention_runtime), so it maps to the sdpa implementation here.
     """
     flash_usable = (
-        importlib.util.find_spec("flash_attn") is not None
+        flash_attn_installed()
         and device.type == "cuda"
         and dtype_mode != "fp32"
     )
@@ -222,7 +245,7 @@ def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> 
     if attention == "sdpa":
         return "sdpa"
     if attention == "flash_attention":
-        if importlib.util.find_spec("flash_attn") is None:
+        if not flash_attn_installed():
             raise ImportError("flash_attention selected but the flash_attn package is not installed.")
         if dtype_mode == "fp32":
             logger.warning("flash_attention does not support fp32; falling back to sdpa.")
