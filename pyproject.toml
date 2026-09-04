@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-breeze-tts-2"
 description = "Breeze TTS 2 nodes for ComfyUI: voice clone, voice design, and voice direction with INT8 ConvRot support."
-version = "1.4.2"
+version = "1.4.3"
 license = { file = "LICENSE" }
 dependencies = [
     "accelerate",

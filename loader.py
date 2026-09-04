@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import gc
+import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -204,6 +205,30 @@ def resolve_dtype_mode(dtype_name: str, device: torch.device) -> str:
     return "fp32"
 
 
+def flash_attn_installed() -> bool:
+    """True only when flash_attn is a genuinely installed distribution.
+
+    find_spec alone is not enough: other node packs (e.g. SeedVR2) inject a
+    stub flash_attn module with a valid __spec__ into sys.modules when the real
+    package is absent, so find_spec reports a false positive. transformers then
+    looks the version up through importlib.metadata and raises
+    PackageNotFoundError deep inside model construction, surfacing as an
+    opaque checkpoint/config error. Requiring the dist-info metadata matches
+    exactly what transformers needs, so a stub is treated as unavailable.
+    """
+    if importlib.util.find_spec("flash_attn") is None:
+        return False
+    try:
+        importlib.metadata.version("flash_attn")
+    except importlib.metadata.PackageNotFoundError:
+        logger.warning(
+            "flash_attn is importable but has no installed package metadata "
+            "(a stub module injected by another custom node); treating it as unavailable."
+        )
+        return False
+    return True
+
+
 def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> str:
     """Returns the transformers attention implementation wired into all submodels.
 
@@ -211,7 +236,7 @@ def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> 
     native.attention_runtime), so it maps to the sdpa implementation here.
     """
     flash_usable = (
-        importlib.util.find_spec("flash_attn") is not None
+        flash_attn_installed()
         and device.type == "cuda"
         and dtype_mode != "fp32"
     )
@@ -222,7 +247,7 @@ def resolve_attention(attention: str, device: torch.device, dtype_mode: str) -> 
     if attention == "sdpa":
         return "sdpa"
     if attention == "flash_attention":
-        if importlib.util.find_spec("flash_attn") is None:
+        if not flash_attn_installed():
             raise ImportError("flash_attention selected but the flash_attn package is not installed.")
         if dtype_mode == "fp32":
             logger.warning("flash_attention does not support fp32; falling back to sdpa.")
@@ -296,12 +321,10 @@ def _ensure_writable_device_property(module: nn.Module) -> None:
 def _register_many_with_comfy(patchers: list) -> None:
     if mm is None:
         return
-    to_load = []
-    already = {id(loaded.model) for loaded in mm.current_loaded_models}
-    for patcher in patchers:
-        if patcher is None or id(patcher.model) in already:
-            continue
-        to_load.append(patcher)
+    # Always delegate: load_models_gpu dedupes by patcher identity and pulls
+    # ComfyUI-offloaded (CPU-parked) weights back onto the device, which is
+    # exactly what resuming a generation needs.
+    to_load = [patcher for patcher in patchers if patcher is not None]
     if to_load:
         mm.load_models_gpu(to_load)
         logger.debug("Loaded %d module(s) through ComfyUI memory management.", len(to_load))
@@ -329,8 +352,11 @@ def register_runtime_module(module: nn.Module, device: torch.device, *, dynamic:
 def _unregister_from_comfy(patcher) -> None:
     if patcher is None or mm is None:
         return
+    # LoadedModel.model is the patcher itself (a dereferenced weakref), so
+    # match on patcher identity — matching against patcher.model (the
+    # nn.Module) never hits and strands dead entries in current_loaded_models.
     for loaded in list(mm.current_loaded_models):
-        if id(loaded.model) == id(patcher.model):
+        if loaded.model is patcher:
             if getattr(loaded, "model_finalizer", None) is not None:
                 loaded.model_finalizer.detach()
             if getattr(loaded, "_patcher_finalizer", None) is not None:
@@ -389,6 +415,7 @@ class BreezeBundle:
     dtype_name: str
     attention: str
     decode_mode: str = "eager"
+    repo_choice: str = ""
     quantized: bool = False
     patchers: list = field(default_factory=list)
 
@@ -491,6 +518,7 @@ def load_breeze_bundle(
         dtype_name=dtype_mode,
         attention=attention_choice,
         decode_mode=decode_mode,
+        repo_choice=repo_choice,
         quantized=bool(quant_map),
     )
 
@@ -526,6 +554,51 @@ def load_breeze_bundle(
 
 def resume_bundle_to_device(bundle: BreezeBundle) -> None:
     _register_many_with_comfy(bundle.patchers)
+
+
+def ensure_bundle_ready(bundle: BreezeBundle | None) -> BreezeBundle:
+    """Return a usable bundle, transparently reloading an unloaded one in place.
+
+    ComfyUI's node cache keeps the bundle object handed out by the Load Model
+    node alive across prompts, but unload_breeze_bundle drops its weights
+    (ComfyUI's unload_all_models hook, VRAM pressure buttons, or a settings
+    change from another load). Using that stale object used to crash deep in
+    the runtime with 'NoneType' has no attribute 'parameters'. Reload into the
+    same object instead, so cached references heal on the next run.
+    """
+    if bundle is None:
+        raise ValueError("No Breeze TTS 2 model provided. Wire in the Breeze TTS 2 Load Model node and run it first.")
+    if bundle.model is not None and bundle.codec is not None and bundle.tokenizer is not None:
+        resume_bundle_to_device(bundle)
+        return bundle
+    global _ACTIVE_BUNDLE
+    logger.info("Breeze TTS 2 model was unloaded (ComfyUI cache clear or settings change); reloading.")
+    fresh = load_breeze_bundle(
+        bundle.repo_choice,
+        bundle.dtype_name,
+        str(bundle.device),
+        bundle.attention,
+        False,
+        bundle.decode_mode,
+    )
+    # Copy onto the cached object identity so references ComfyUI already
+    # handed to downstream nodes become valid again. The load key computed
+    # inside load_breeze_bundle describes both objects equally, so only the
+    # active-bundle pointer needs re-aiming at the healed object.
+    bundle.model = fresh.model
+    bundle.codec = fresh.codec
+    bundle.tokenizer = fresh.tokenizer
+    bundle.model_dir = fresh.model_dir
+    bundle.weights_name = fresh.weights_name
+    bundle.device = fresh.device
+    bundle.dtype_name = fresh.dtype_name
+    bundle.attention = fresh.attention
+    bundle.decode_mode = fresh.decode_mode
+    bundle.repo_choice = fresh.repo_choice
+    bundle.quantized = fresh.quantized
+    bundle.patchers = fresh.patchers
+    _ACTIVE_BUNDLE = bundle
+    return bundle
 
 
 _POOL_WARN_LINES = (

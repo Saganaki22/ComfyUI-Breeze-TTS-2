@@ -162,7 +162,7 @@ def _generate_audio(
 ) -> dict:
     if not text or not text.strip():
         raise ValueError("Text cannot be empty.")
-    loader.resume_bundle_to_device(bundle)
+    bundle = loader.ensure_bundle_ready(bundle)
     device = bundle.device
 
     if ref_codes is None and ref_audio is not None:
@@ -767,6 +767,7 @@ def _multi_speaker_audio(
     seed: int,
     controls: dict,
 ) -> dict:
+    bundle = loader.ensure_bundle_ready(bundle)
     turns = _parse_script(text)
 
     cast: dict[str, tuple[int, dict]] = {}
@@ -822,7 +823,6 @@ def _multi_speaker_audio(
         cast_summary,
     )
 
-    loader.resume_bundle_to_device(bundle)
     ref_codes: dict[str, torch.Tensor] = {}
     for key in used:
         _slot, speaker = cast[key]

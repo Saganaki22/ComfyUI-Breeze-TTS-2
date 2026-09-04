@@ -8,7 +8,7 @@ import logging
 import sys
 import types
 
-__version__ = "v1.4.2"
+__version__ = "v1.4.3"
 
 logger = logging.getLogger("BreezeTTS2")
 logger.propagate = False
