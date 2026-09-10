@@ -19,6 +19,7 @@ from torch import nn
 
 from . import int8
 from . import native
+from . import runtime
 from .vendor.codec_config import Qwen3TTSTokenizerV2Config
 from .vendor.codec_model import Qwen3TTSTokenizerV2Model
 
@@ -542,7 +543,9 @@ def load_breeze_bundle(
         raise
     bundle.patchers = patchers
 
-    if bundle.quantized:
+    if bundle.quantized and runtime.ensure_cuda_rng_usable(device):
+        # The banner draws random weights for its sample matmul; skip it
+        # rather than crash the load if the CUDA RNG can't be healed.
         int8.log_int8_banner(model, device)
 
     _ACTIVE_BUNDLE = bundle

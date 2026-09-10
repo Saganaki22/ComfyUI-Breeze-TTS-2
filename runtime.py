@@ -8,6 +8,7 @@ layout, and EOS/pad handling follow the upstream implementation exactly.
 
 from __future__ import annotations
 
+import gc
 import inspect
 import logging
 import random
@@ -286,6 +287,94 @@ def _check_interrupted() -> None:
         pass
 
 
+# --------------------------------------------------------------------------- #
+# CUDA RNG poison healing (ComfyUI 0.35.0+ "Offset increment" crash, issue #10)
+# --------------------------------------------------------------------------- #
+# Every torch.cuda.graph capture registers the *default* CUDA generator and
+# sets its capturing_ flag (capture_prologue). If a capture fails after that
+# point but before capture_end (mempool conflicts, nested captures, invalid
+# ops), the flag stays stuck: every later CUDA RNG call anywhere in the
+# process — including torch.multinomial in sample_logits — raises
+# "RuntimeError: Offset increment outside graph capture encountered
+# unexpectedly." The flag is shared process state, so the crash surfaces in
+# whichever node samples first, not necessarily in the one that broke the
+# capture. ComfyUI 0.35.0's model compiler captures CUDA graphs around its own
+# model runs, which makes such stuck captures much more likely.
+_RNG_POISON_MESSAGE = "Offset increment outside graph capture"
+
+
+def is_rng_poison_error(exc: BaseException | None) -> bool:
+    return isinstance(exc, RuntimeError) and _RNG_POISON_MESSAGE in str(exc)
+
+
+def heal_cuda_rng() -> bool:
+    """Un-poison the shared default CUDA generator after an aborted capture.
+
+    Two layers, because a failed capture can leave two kinds of damage:
+      1. The generator's capturing_ flag stuck true (fixed by swapping in a
+         fresh generator state via graphsafe_set_state).
+      2. A capture invalidated at the driver level with the current stream
+         parked on the capture stream (fixed by restoring the default stream,
+         then synchronizing and flushing the allocator).
+    Returns True when a probe RNG call succeeds afterwards.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        device = torch.cuda.current_device()
+        torch.rand(1, device=device)
+        return True  # not poisoned; nothing to do
+    except RuntimeError:
+        pass
+    try:
+        generator = torch.cuda.default_generators[torch.cuda.current_device()]
+        generator.graphsafe_set_state(torch.Generator(device="cuda"))
+        torch.rand(1, device="cuda")
+        logger.warning(
+            "cuda_graphs: CUDA RNG state was left poisoned by an aborted graph "
+            "capture; reset the generator state."
+        )
+        return True
+    except RuntimeError:
+        pass
+    try:
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.rand(1, device="cuda")
+        logger.warning(
+            "cuda_graphs: CUDA RNG state was left poisoned by an invalidated "
+            "graph capture; restored the default stream and reset the "
+            "generator state."
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "cuda_graphs: failed to heal the poisoned CUDA RNG state; "
+            "generation cannot sample. Restarting ComfyUI clears it.",
+            exc_info=True,
+        )
+        return False
+
+
+def ensure_cuda_rng_usable(device=None) -> bool:
+    """Probe the CUDA RNG and heal it if a stuck capture poisoned it."""
+    if device is not None and device.type != "cuda":
+        return True
+    try:
+        torch.rand(1, device="cuda" if device is None else device)
+        return True
+    except RuntimeError as exc:
+        if not is_rng_poison_error(exc):
+            raise
+    logger.warning(
+        "cuda_graphs: CUDA RNG state was left poisoned by an aborted graph "
+        "capture elsewhere in the process; healing before generation."
+    )
+    return heal_cuda_rng()
+
+
 def _new_static_cache(config, max_cache_len: int, batch: int, device, dtype):
     # transformers renamed StaticCache's batch argument between 4.x and 5.x.
     params = inspect.signature(StaticCache.__init__).parameters
@@ -436,6 +525,9 @@ class _DepthRunner:
             self.use_graph = False
             self._graph_prefill = None
             self._graph_steps = None
+            # A failed capture can leave the shared default generator's
+            # capture flag stuck; heal it so the eager fallback can sample.
+            heal_cuda_rng()
 
     def _call(self, entry, eager, data, *args) -> torch.Tensor:
         if entry is None:
@@ -542,7 +634,7 @@ def get_depth_runner(model, params: GenerationParams, cfg_scale: float, batch: i
 
 
 @torch.inference_mode()
-def generate_codes(
+def _generate_codes_impl(
     model,
     *,
     inputs_embeds: torch.Tensor,
@@ -659,6 +751,66 @@ def generate_codes(
     if not frames:
         raise RuntimeError("Breeze TTS 2 produced no audio frames.")
     return torch.stack(frames, dim=0)
+
+
+def generate_codes(
+    model,
+    *,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    base_positions: torch.Tensor,
+    prefill_len: int,
+    cfg_scale: float,
+    params: GenerationParams,
+    progress_callback: Callable[[int], None] | None = None,
+    decode_mode: str = "eager",
+) -> torch.Tensor:
+    """Generate codec codes, healing a poisoned CUDA RNG state if needed.
+
+    Sampling anywhere in the process raises "Offset increment outside graph
+    capture encountered unexpectedly" once some other CUDA graph capture has
+    left the shared default generator stuck (issue #10, seen since ComfyUI
+    0.35.0). Probe up front, and retry once after healing if it strikes
+    mid-generation.
+    """
+    ensure_cuda_rng_usable(inputs_embeds.device)
+    try:
+        return _generate_codes_impl(
+            model,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            base_positions=base_positions,
+            prefill_len=prefill_len,
+            cfg_scale=cfg_scale,
+            params=params,
+            progress_callback=progress_callback,
+            decode_mode=decode_mode,
+        )
+    except RuntimeError as exc:
+        if not is_rng_poison_error(exc):
+            raise
+    logger.warning(
+        "cuda_graphs: sampling hit a CUDA RNG state poisoned by an aborted "
+        "graph capture; healing and retrying the generation once."
+    )
+    if not heal_cuda_rng():
+        raise RuntimeError(
+            "Breeze TTS 2 cannot sample: the CUDA RNG state was left stuck by "
+            "an aborted CUDA graph capture and could not be healed. Restart "
+            "ComfyUI to clear it."
+        )
+    with torch.inference_mode():
+        return _generate_codes_impl(
+            model,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            base_positions=base_positions,
+            prefill_len=prefill_len,
+            cfg_scale=cfg_scale,
+            params=params,
+            progress_callback=progress_callback,
+            decode_mode=decode_mode,
+        )
 
 
 # --------------------------------------------------------------------------- #
