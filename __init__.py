@@ -8,7 +8,7 @@ import logging
 import sys
 import types
 
-__version__ = "v1.4.4"
+__version__ = "v1.4.5"
 
 logger = logging.getLogger("BreezeTTS2")
 logger.propagate = False
@@ -45,11 +45,18 @@ def _block_broken_torchcodec() -> None:
     A torchcodec built for a different torch (its wheels pin to torch minors)
     fails to load with a Windows 'Entry Point Not Found' dialog; probe with
     loader popups suppressed so the user never sees it, then fall back to the
-    stub when the import fails.
+    stub when the import fails. faulthandler is also parked for the probe:
+    otherwise the caught loader error prints a scary "Windows fatal exception"
+    stack at every ComfyUI startup even though it is handled here.
     """
     restore_error_mode = _no_dll_dialogs()
+    import faulthandler
+
+    faulthandler_was_enabled = faulthandler.is_enabled()
     try:
         try:
+            if faulthandler_was_enabled:
+                faulthandler.disable()
             torchcodec = importlib.import_module("torchcodec")
             if torchcodec is not None and getattr(torchcodec, "__spec__", None) is not None:
                 return
@@ -57,6 +64,8 @@ def _block_broken_torchcodec() -> None:
         except Exception:
             pass
     finally:
+        if faulthandler_was_enabled:
+            faulthandler.enable()
         if restore_error_mode is not None:
             restore_error_mode()
 
@@ -108,3 +117,4 @@ except Exception:
     logger.exception("Failed to register Breeze TTS 2 nodes.")
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "__version__"]
+
