@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -40,52 +41,80 @@ except Exception:
     folder_paths = None
 
 
-def _whisper_root() -> Path:
+WHISPER_FOLDER_NAME = "audio_encoders"
+
+
+def _whisper_roots() -> list[Path]:
+    """Every folder searched for Whisper models, in priority order.
+
+    Same layering as loader.model_dirs(): the running install's models tree
+    first, then any path registered for "audio_encoders" (an
+    extra_model_paths.yaml section can map it directly), then audio_encoders
+    folders inside models trees mapped through standard folder names only.
+    """
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def add(candidate: Path) -> None:
+        folded = os.path.normcase(str(candidate))
+        if folded not in seen:
+            seen.add(folded)
+            dirs.append(candidate)
+
     if folder_paths is not None:
-        root = Path(folder_paths.models_dir) / "audio_encoders"
+        add(Path(folder_paths.models_dir) / WHISPER_FOLDER_NAME)
+        for extra in folder_paths.folder_names_and_paths.get(WHISPER_FOLDER_NAME, ([], set()))[0]:
+            add(Path(extra))
+        for root in loader.mapped_models_roots():
+            candidate = root / WHISPER_FOLDER_NAME
+            if candidate.is_dir():
+                add(candidate)
     else:
-        root = Path(__file__).resolve().parent / "models" / "audio_encoders"
-    root.mkdir(parents=True, exist_ok=True)
-    if folder_paths is not None:
-        registered = folder_paths.folder_names_and_paths.get("audio_encoders")
-        if registered is None or str(root) not in [str(p) for p in registered[0]]:
-            folder_paths.add_model_folder_path("audio_encoders", str(root))
-    return root
+        dirs.append(Path(__file__).resolve().parent / "models" / WHISPER_FOLDER_NAME)
+    return dirs
 
 
 def whisper_model_choices() -> list[str]:
     choices = list(POPULAR_WHISPER_MODELS.keys())
-    root = _whisper_root()
-    for child in sorted(root.iterdir()):
-        if child.is_dir() and (child / "config.json").is_file():
-            if child.name not in choices:
+    for root in _whisper_roots():
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and (child / "config.json").is_file() and child.name not in choices:
                 choices.append(child.name)
     return choices
 
 
 def _resolve_whisper_dir(model_name: str, download_if_missing: bool) -> Path:
+    roots = _whisper_roots()
     if model_name in POPULAR_WHISPER_MODELS:
         repo_id = POPULAR_WHISPER_MODELS[model_name]
-        local = _whisper_root() / repo_id.replace("/", "_")
-        if not (local / "config.json").is_file():
-            if not download_if_missing:
-                raise FileNotFoundError(
-                    f"Whisper model '{model_name}' not found at {local}. Enable download_if_missing."
-                )
-            from huggingface_hub import snapshot_download
-
-            logger.info("Downloading Whisper model %s to %s", repo_id, local)
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(local),
-                ignore_patterns=WHISPER_IGNORE_PATTERNS,
-                endpoint=loader.HF_ENDPOINT,
+        folder_name = repo_id.replace("/", "_")
+        for root in roots:
+            local = root / folder_name
+            if (local / "config.json").is_file():
+                return local
+        local = roots[0] / folder_name
+        if not download_if_missing:
+            raise FileNotFoundError(
+                f"Whisper model '{model_name}' not found (looked in {[str(r / folder_name) for r in roots]}). "
+                "Enable download_if_missing."
             )
+        from huggingface_hub import snapshot_download
+
+        logger.info("Downloading Whisper model %s to %s", repo_id, local)
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(local),
+            ignore_patterns=WHISPER_IGNORE_PATTERNS,
+            endpoint=loader.HF_ENDPOINT,
+        )
         return local
-    local = _whisper_root() / model_name
-    if (local / "config.json").is_file():
-        return local
-    raise FileNotFoundError(f"Whisper model folder '{model_name}' not found under {_whisper_root()}.")
+    for root in roots:
+        local = root / model_name
+        if (local / "config.json").is_file():
+            return local
+    raise FileNotFoundError(f"Whisper model folder '{model_name}' not found under {[str(r) for r in roots]}.")
 
 
 def _resolve_whisper_dtype(dtype_name: str, device: torch.device) -> torch.dtype:

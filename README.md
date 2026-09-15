@@ -101,7 +101,7 @@ All mirrors live in [drbaph/Breeze-TTS-2-comfyui](https://huggingface.co/drbaph/
 
 ## Model Files
 
-Weights are stored per source repo under `ComfyUI/models/breezetts2/` (primary folder first; extra_model_paths.yaml entries and symlinks are searched too). Missing files download automatically when `download_if_missing` is on, otherwise the error names the expected folder.
+Weights are stored per source repo under `ComfyUI/models/breezetts2/` (primary folder first; symlinks are searched too). Every models tree mapped through `extra_model_paths.yaml` is also searched, including sections that only list standard folders like `checkpoints:` — a `breezetts2/` folder inside any mapped tree is picked up, so one fixed location can serve every ComfyUI install. Mapped folders are read-only to the node: new downloads always land in the running install's own models folder. An explicit `breezetts2:` entry in the yaml works as well. Missing files download automatically when `download_if_missing` is on, otherwise the error names the expected folder.
 
 ```
 📂 ComfyUI/

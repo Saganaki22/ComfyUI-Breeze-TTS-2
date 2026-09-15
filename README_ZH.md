@@ -84,7 +84,7 @@ Bob: 恕我直言，潮汐表上写得清清楚楚。
 
 ## 模型文件
 
-权重按来源仓库存放在 `ComfyUI/models/breezetts2/` 下（优先主目录；extra_model_paths.yaml 条目与符号链接同样会被搜索）。开启 `download_if_missing` 时缺失文件会自动下载，否则报错信息会指出预期目录。
+权重按来源仓库存放在 `ComfyUI/models/breezetts2/` 下（优先主目录；符号链接同样会被搜索）。通过 `extra_model_paths.yaml` 映射的模型目录树也都会被搜索——包括只映射了 `checkpoints:` 等标准文件夹的配置段：只要映射目录里存在 `breezetts2/` 文件夹即可被识别，这样一个固定位置就能同时服务多个 ComfyUI 安装。映射目录对节点是只读的：新下载始终落在当前运行的 ComfyUI 自己的 models 目录。在 yaml 中显式写 `breezetts2:` 条目同样有效。开启 `download_if_missing` 时缺失文件会自动下载，否则报错信息会指出预期目录。
 
 ```
 📂 ComfyUI/

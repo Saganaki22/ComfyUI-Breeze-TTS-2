@@ -103,16 +103,75 @@ def _safe_repo_name(repo_id: str) -> str:
     return repo_id
 
 
+# Folder names that always live directly inside a models root. The paths
+# ComfyUI has registered for them (including every tree mapped through
+# extra_model_paths.yaml) reveal where the user's models trees are, so custom
+# model folders like "breezetts2" can be searched there too.
+_ROOT_PROBE_KEYS = (
+    "checkpoints", "configs", "loras", "vae", "clip", "text_encoders",
+    "diffusion_models", "unet", "clip_vision", "style_models", "embeddings",
+    "diffusers", "vae_approx", "controlnet", "gligen", "upscale_models",
+    "latent_upscale_models", "hypernetworks", "photomaker", "classifiers",
+    "model_patches", "audio_encoders", "background_removal",
+    "frame_interpolation", "geometry_estimation", "optical_flow", "detection",
+    # Our own folder, so a root mapped through a "breezetts2:" yaml key alone
+    # is still probed for e.g. its audio_encoders folder.
+    MODEL_FOLDER_NAME,
+)
+
+
+def mapped_models_roots() -> list[Path]:
+    """Models roots known to ComfyUI besides the running install's own.
+
+    Users who pin their models at a fixed location (portable installs, a
+    shared drive) map it into every ComfyUI through extra_model_paths.yaml
+    sections like ``base_path: D:/ComfyUI/models`` — but those sections only
+    register the standard folder names they list, so a custom folder such as
+    ``breezetts2`` is invisible to them. The parent directories of the
+    registered standard folders are those mapped models roots; return each
+    distinct one that exists on disk, excluding the running install's own.
+    """
+    roots: list[Path] = []
+    seen: set[str] = set()
+    if folder_paths is None:
+        return roots
+    own = os.path.normcase(str(Path(folder_paths.models_dir)))
+    for key in _ROOT_PROBE_KEYS:
+        for path in folder_paths.folder_names_and_paths.get(key, ([], set()))[0]:
+            root = Path(path).parent
+            folded = os.path.normcase(str(root))
+            if folded in seen or folded == own or not root.is_dir():
+                continue
+            seen.add(folded)
+            roots.append(root)
+    return roots
+
+
 def model_dirs() -> list[Path]:
     dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def add(candidate: Path) -> None:
+        folded = os.path.normcase(str(candidate))
+        if folded not in seen:
+            seen.add(folded)
+            dirs.append(candidate)
+
     if folder_paths is not None:
-        primary = Path(folder_paths.models_dir) / MODEL_FOLDER_NAME
+        # Search target and download home: the running install's models tree.
+        add(Path(folder_paths.models_dir) / MODEL_FOLDER_NAME)
+        # Explicitly registered paths — an extra_model_paths.yaml section can
+        # map "breezetts2:" directly (is_default entries already sit first).
         for extra in folder_paths.folder_names_and_paths.get(MODEL_FOLDER_NAME, ([], set()))[0]:
-            candidate = Path(extra)
-            if candidate not in dirs:
-                dirs.append(candidate)
-        if primary not in dirs:
-            dirs.insert(0, primary)
+            add(Path(extra))
+        # Models trees mapped through standard folder names only: their yaml
+        # sections don't list "breezetts2", but a breezetts2 folder placed in
+        # such a tree is picked up. Existing folders only, so nothing is ever
+        # created or written inside a mapped location.
+        for root in mapped_models_roots():
+            candidate = root / MODEL_FOLDER_NAME
+            if candidate.is_dir():
+                add(candidate)
     else:
         dirs.append(Path(__file__).resolve().parent / "models" / MODEL_FOLDER_NAME)
     return dirs
