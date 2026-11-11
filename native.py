@@ -904,6 +904,8 @@ class _ComfyLinear(nn.Linear):
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
+    # ComfyUI 2026-11 combined-linear support expects this on custom castables.
+    _combined_linear = None
 
     def forward(self, x):
         if not hasattr(self, "_v") and self.weight.device == x.device:
@@ -920,6 +922,7 @@ class _ComfyEmbedding(nn.Embedding):
     weight_function = []
     bias_function = []
     bias = None
+    _combined_linear = None
 
     def _weight_dtype(self):
         return getattr(self, "weight_comfy_model_dtype", None) or self.weight.dtype
@@ -987,6 +990,7 @@ def _patch_rmsnorm(module: nn.Module, forward_fn) -> None:
     module.comfy_cast_weights = True
     module.weight_function = []
     module.bias_function = []
+    module._combined_linear = None
     module.forward = forward_fn.__get__(module, module.__class__)
     module._breeze_comfy_cast = True
 
