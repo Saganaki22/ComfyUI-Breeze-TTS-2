@@ -901,6 +901,7 @@ class BreezeInferenceModel(nn.Module):
 # ComfyUI-castable module shims (same approach as the FireRedTTS3 / Raon packs)
 # --------------------------------------------------------------------------- #
 class _ComfyLinear(nn.Linear):
+    _combined_linear = None
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
@@ -916,6 +917,7 @@ class _ComfyLinear(nn.Linear):
 
 
 class _ComfyEmbedding(nn.Embedding):
+    _combined_linear = None
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
