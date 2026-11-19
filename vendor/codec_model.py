@@ -3,7 +3,10 @@
 Only the 12 Hz tokenizer (v2) is vendored. Patched for transformers 4.57-5.16:
 check_model_inputs is shimmed with a no-op decorator (the upstream symbol kept
 changing calling convention), and mask kwargs are filtered per installed
-signature (cache_position was removed in transformers>=5.9).
+signature (cache_position was removed in transformers>=5.9). The encoder half
+is no longer transformers.MimiModel (5.17 split it into half-models with
+read-only properties and a key layout the checkpoint predates); it lives in
+`.mimi_encoder`.
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 from torch.nn import functional as F
-from transformers import MimiConfig, MimiModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
@@ -73,6 +75,7 @@ from .codec_config import (
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2DecoderConfig,
 )
+from .mimi_encoder import MimiEncoderModel
 
 logger = logging.get_logger(__name__)
 
@@ -943,16 +946,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return torch.cat(wavs, dim=-1)
 
 
-class Qwen3TTSTokenizerV2Encoder(MimiModel):
-    def __init__(self, config: MimiConfig):
-        super().__init__(config)
-        self.config = config
-
-        self.upsample = None
-        self.decoder_transformer = None
-        self.decoder = None
-
-        self.post_init()
+class Qwen3TTSTokenizerV2Encoder(MimiEncoderModel):
+    """Encoder half of the 12 Hz tokenizer (flat `encoder.*` checkpoint keys)."""
 
 
 @auto_docstring
