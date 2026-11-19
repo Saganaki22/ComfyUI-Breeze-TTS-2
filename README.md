@@ -156,6 +156,8 @@ data is in `benchmark_report.json` on the mirror repo.
   `T5Gemma2TextEncoder` wired into flash attention through a custom-registered FA2 path
   (upstream blocks it over softcapping concerns this checkpoint does not have); on 4.x it
   uses the vendored upstream compat implementation, which also runs flash attention.
+  The audio tokenizer encoder is vendored (`vendor/mimi_encoder.py`) so it is immune to
+  the `MimiModel` half-model split that transformers 5.17 introduced.
 - torch/torchaudio from your ComfyUI install. `flash_attn` and `sageattention` are optional.
 - `comfy-kitchen` ships with current ComfyUI and is only imported when an INT8 checkpoint is loaded.
 

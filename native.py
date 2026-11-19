@@ -151,6 +151,26 @@ except Exception:
     def _uncast_bias_weight(module, weight, bias, stream=None):
         return None
 
+# Comfy's DynamicVRAM/VBAR pager (comfy/ops.py: cast_modules_with_vbar) reads
+# `s._combined_linear` unguarded on every VBAR-castable module, and the rest of
+# the cast contract (comfy_force_forward, weight/bias_function) rides on the
+# same mixin. Comfy's own Linear/Embedding derive from CastWeightBiasOp; our
+# shims must too, or a large weight (which the patcher backs with `_v` instead
+# of force-loading) crashes the first time it is paged to another device.
+_ComfyCastBase = getattr(
+    globals().get("_comfy_ops", None), "CastWeightBiasOp", None
+) or type(
+    "ComfyCastShimBase",
+    (),
+    {  # mirrors the real mixin's class attributes, for installs predating it
+        "comfy_cast_weights": False,
+        "comfy_force_forward": False,
+        "weight_function": [],
+        "bias_function": [],
+        "_combined_linear": None,
+    },
+)
+
 
 logger = logging.getLogger("BreezeTTS2")
 
@@ -900,7 +920,7 @@ class BreezeInferenceModel(nn.Module):
 # --------------------------------------------------------------------------- #
 # ComfyUI-castable module shims (same approach as the FireRedTTS3 / Raon packs)
 # --------------------------------------------------------------------------- #
-class _ComfyLinear(nn.Linear):
+class _ComfyLinear(_ComfyCastBase, nn.Linear):
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
@@ -915,7 +935,7 @@ class _ComfyLinear(nn.Linear):
             _uncast_bias_weight(self, weight, bias, stream)
 
 
-class _ComfyEmbedding(nn.Embedding):
+class _ComfyEmbedding(_ComfyCastBase, nn.Embedding):
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
@@ -987,6 +1007,7 @@ def _patch_rmsnorm(module: nn.Module, forward_fn) -> None:
     module.comfy_cast_weights = True
     module.weight_function = []
     module.bias_function = []
+    module._combined_linear = None  # cast contract: comfy/ops.py reads it unguarded
     module.forward = forward_fn.__get__(module, module.__class__)
     module._breeze_comfy_cast = True
 
