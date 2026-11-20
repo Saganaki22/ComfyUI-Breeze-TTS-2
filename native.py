@@ -668,7 +668,12 @@ class BreezeBackboneModelEmbeddings(nn.Module):
         )
 
     def forward(self, input_ids):
-        input_embeds = self.embed_audio_tokens(input_ids + self.audio_tokens_offsets)
+        # ComfyUI's partial loader never relocates this non-persistent buffer:
+        # the owning module has no direct parameters, so it is not in the
+        # patcher's load list. Follow the activations' device, the same way
+        # BreezeRotaryEmbedding handles inv_freq.
+        offsets = self.audio_tokens_offsets.to(input_ids.device)
+        input_embeds = self.embed_audio_tokens(input_ids + offsets)
         if self.audio_embeds_projector:
             input_embeds = self.audio_embeds_projector(input_embeds)
         input_embeds = input_embeds.sum(dim=2)
@@ -904,6 +909,7 @@ class _ComfyLinear(nn.Linear):
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
+    _combined_linear = None
 
     def forward(self, x):
         if not hasattr(self, "_v") and self.weight.device == x.device:
@@ -920,6 +926,7 @@ class _ComfyEmbedding(nn.Embedding):
     weight_function = []
     bias_function = []
     bias = None
+    _combined_linear = None
 
     def _weight_dtype(self):
         return getattr(self, "weight_comfy_model_dtype", None) or self.weight.dtype
@@ -987,6 +994,7 @@ def _patch_rmsnorm(module: nn.Module, forward_fn) -> None:
     module.comfy_cast_weights = True
     module.weight_function = []
     module.bias_function = []
+    module._combined_linear = None
     module.forward = forward_fn.__get__(module, module.__class__)
     module._breeze_comfy_cast = True
 

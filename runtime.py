@@ -865,7 +865,7 @@ def tensor_audio_to_comfy(audio: torch.Tensor, sample_rate: int = SAMPLE_RATE) -
 
 def encode_reference_audio(codec_model, wav: torch.Tensor, sample_rate: int) -> torch.Tensor:
     """Encode a float waveform into codec codes [frames, 16] (int, cpu)."""
-    device = next(codec_model.parameters()).device
+    device = codec_model.device
     dtype = next(codec_model.parameters()).dtype
     if sample_rate != int(codec_model.config.input_sample_rate):
         import torchaudio.functional as AF
@@ -880,7 +880,7 @@ def encode_reference_audio(codec_model, wav: torch.Tensor, sample_rate: int) -> 
 
 def decode_codes(codec_model, codes: torch.Tensor) -> torch.Tensor:
     """Decode codec codes [frames, 16] into a float waveform at 24 kHz."""
-    device = next(codec_model.parameters()).device
+    device = codec_model.device
     codes = codes.to(device=device, dtype=torch.long).unsqueeze(0)
     decoded = codec_model.decode(codes, return_dict=True)
     audio = decoded.audio_values[0]

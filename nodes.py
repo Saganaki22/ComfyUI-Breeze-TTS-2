@@ -171,7 +171,10 @@ def _generate_audio(
         wav, sample_rate = runtime.comfy_audio_to_tensor(ref_audio)
         if wav.numel() == 0:
             raise ValueError("Reference audio is empty.")
+        loader.resume_codec_to_device(bundle)
         ref_codes = runtime.encode_reference_audio(bundle.codec, wav, sample_rate)
+        # Making room for the codec may have offloaded the speech model.
+        loader.resume_bundle_to_device(bundle)
         ref_seconds = ref_codes.shape[0] / runtime.FRAMES_PER_SECOND
         if ref_seconds > runtime.MAX_REFERENCE_SECONDS:
             raise ValueError(
@@ -252,6 +255,7 @@ def _generate_audio(
                 progress_callback=on_frame_progress,
                 decode_mode=bundle.decode_mode,
             )
+        loader.resume_codec_to_device(bundle)
         wav = runtime.decode_codes(bundle.codec, codes)
     finally:
         if cli_pbar is not None:
@@ -824,6 +828,8 @@ def _multi_speaker_audio(
     )
 
     ref_codes: dict[str, torch.Tensor] = {}
+    if any(cast[key][1]["ref_audio"] is not None for key in used):
+        loader.resume_codec_to_device(bundle)
     for key in used:
         _slot, speaker = cast[key]
         if speaker["ref_audio"] is None:

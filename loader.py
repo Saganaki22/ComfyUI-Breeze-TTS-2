@@ -586,8 +586,8 @@ def load_breeze_bundle(
     try:
         # cuda_graphs captures weight addresses at compile time, so the model
         # must stay resident: register it non-dynamic (AIMDO paging off). The
-        # codec is pinned too: at ~280MB, dynamic paging just re-staged it on
-        # every decode, spamming a "prepared for dynamic VRAM" line per
+        # codec is pinned too: at ~650 MB fp32, dynamic paging just re-staged
+        # it on every decode, spamming a "prepared for dynamic VRAM" line per
         # multi-speaker turn and adding latency.
         patcher = register_runtime_module(model, device, dynamic=False if decode_mode == "cuda_graphs" else None)
         if patcher is not None:
@@ -616,6 +616,17 @@ def load_breeze_bundle(
 
 def resume_bundle_to_device(bundle: BreezeBundle) -> None:
     _register_many_with_comfy(bundle.patchers)
+
+
+def resume_codec_to_device(bundle: BreezeBundle | None) -> bool:
+    """Let ComfyUI make room for a complete codec encode/decode pass."""
+    if mm is None or bundle is None or bundle.codec is None:
+        return False
+    for patcher in bundle.patchers:
+        if patcher.model is bundle.codec:
+            mm.load_models_gpu([patcher], force_full_load=True)
+            return True
+    return False
 
 
 def ensure_bundle_ready(bundle: BreezeBundle | None) -> BreezeBundle:

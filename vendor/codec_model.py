@@ -1,9 +1,10 @@
 """Vendored from qwen-tts 0.1.1 (github.com/Qwen/Qwen3-TTS), Apache-2.0.
 
-Only the 12 Hz tokenizer (v2) is vendored. Patched for transformers 4.57-5.16:
+Only the 12 Hz tokenizer (v2) is vendored. Patched for transformers>=4.57:
 check_model_inputs is shimmed with a no-op decorator (the upstream symbol kept
 changing calling convention), and mask kwargs are filtered per installed
-signature (cache_position was removed in transformers>=5.9).
+signature (cache_position was removed in transformers>=5.9). The encoder uses
+Mimi components with flat checkpoint names across the 5.17 model split.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 from torch.nn import functional as F
-from transformers import MimiConfig, MimiModel
+from transformers import MimiConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
@@ -30,6 +31,14 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.mimi.modeling_mimi import (
+    MimiConv1d,
+    MimiEncoder,
+    MimiEncoderOutput,
+    MimiPreTrainedModel,
+    MimiSplitResidualVectorQuantizer,
+    MimiTransformerModel,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
@@ -262,7 +271,10 @@ class Qwen3TTSTokenizerV2ConvNeXtBlock(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.pwconv2(hidden_states)
 
-        hidden_states = self.gamma * hidden_states
+        # gamma lives directly on a module whose other parameters belong to
+        # child modules, so ComfyUI's partial loader never relocates it. Follow
+        # the activations' device, like the rotary inv_freq buffers do.
+        hidden_states = self.gamma.to(hidden_states.device) * hidden_states
 
         hidden_states = hidden_states.permute(0, 2, 1)
 
@@ -537,6 +549,10 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         cache_position=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        """
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Positions of the input tokens in the key-value cache.
+        """
         if input_ids is not None:
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -943,16 +959,40 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return torch.cat(wavs, dim=-1)
 
 
-class Qwen3TTSTokenizerV2Encoder(MimiModel):
+class Qwen3TTSTokenizerV2Encoder(MimiPreTrainedModel):
+    """Compose the encoder with the flat module names used by the checkpoint."""
+
     def __init__(self, config: MimiConfig):
         super().__init__(config)
-        self.config = config
-
-        self.upsample = None
-        self.decoder_transformer = None
-        self.decoder = None
-
+        self.encoder = MimiEncoder(config)
+        self.encoder_transformer = MimiTransformerModel(config)
+        self.downsample = (
+            MimiConv1d(
+                config,
+                config.hidden_size,
+                config.hidden_size,
+                kernel_size=2 * int(config.encodec_frame_rate / config.frame_rate),
+                stride=2,
+                bias=False,
+                pad_mode="replicate",
+            )
+            if config.frame_rate != config.encodec_frame_rate else None
+        )
+        self.quantizer = MimiSplitResidualVectorQuantizer(config)
         self.post_init()
+
+    def encode(self, input_values, num_quantizers=None, return_dict=None):
+        hidden_states = self.encoder(input_values)
+        hidden_states = self.encoder_transformer(
+            hidden_states.transpose(1, 2), use_cache=False
+        ).last_hidden_state.transpose(1, 2)
+        if self.downsample is not None:
+            hidden_states = self.downsample(hidden_states)
+        audio_codes = self.quantizer.encode(hidden_states, num_quantizers).transpose(0, 1)
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        if not return_dict:
+            return (audio_codes,)
+        return MimiEncoderOutput(audio_codes=audio_codes)
 
 
 @auto_docstring
